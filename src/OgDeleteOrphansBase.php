@@ -128,6 +128,13 @@ abstract class OgDeleteOrphansBase extends PluginBase implements OgDeleteOrphans
    */
   protected function deleteOrphan($entity_type, $entity_id) {
     $entity = $this->entityTypeManager->getStorage($entity_type)->load($entity_id);
+
+    // The entity might already be removed by other modules that implement
+    // hook_entity_delete().
+    if (!$entity) {
+      return;
+    }
+
     // Only delete content that is fully orphaned, i.e. it is no longer
     // associated with any groups.
     $group_count = $this->membershipManager->getGroupCount($entity);
@@ -149,7 +156,7 @@ abstract class OgDeleteOrphansBase extends PluginBase implements OgDeleteOrphans
   /**
    * {@inheritdoc}
    */
-  public function configurationForm($form, FormStateInterface $form_state) {
+  public function configurationForm(array $form, FormStateInterface $form_state) {
     return [];
   }
 

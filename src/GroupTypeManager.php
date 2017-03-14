@@ -5,9 +5,8 @@ namespace Drupal\og;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Entity\EntityTypeBundleInfoInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Routing\RouteBuilderInterface;
 use Drupal\Core\State\StateInterface;
-use Drupal\og\Event\DefaultRoleEvent;
-use Drupal\og\Event\DefaultRoleEventInterface;
 use Drupal\og\Event\GroupCreationEvent;
 use Drupal\og\Event\GroupCreationEventInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
@@ -15,7 +14,7 @@ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 /**
  * A manager to keep track of which entity type/bundles are OG group enabled.
  */
-class GroupManager {
+class GroupTypeManager {
 
   /**
    * The key used to identify the cached version of the group relation map.
@@ -93,9 +92,10 @@ class GroupManager {
    * Do not access this property directly, use $this->getGroupRelationMap()
    * instead.
    *
-   * @var array $groupRelationMap
-   *   An associative array representing group and group content relations, in
-   *   the following format:
+   * @var array
+   *   An associative array representing group and group content relations.
+   *
+   * This mapping is in the following format:
    * @code
    *   [
    *     'group_entity_type_id' => [
@@ -118,7 +118,28 @@ class GroupManager {
   protected $moduleHandler;
 
   /**
-   * Constructs an GroupManager object.
+   * The OG role manager.
+   *
+   * @var \Drupal\og\OgRoleManagerInterface
+   */
+  protected $ogRoleManager;
+
+  /**
+   * The route builder service.
+   *
+   * @var \Drupal\Core\Routing\RouteBuilderInterface
+   */
+  protected $routeBuilder;
+
+  /**
+   * The OG group audience helper.
+   *
+   * @var \Drupal\og\OgGroupAudienceHelperInterface
+   */
+  protected $groupAudienceHelper;
+
+  /**
+   * Constructs a GroupTypeManager object.
    *
    * @param \Drupal\Core\Config\ConfigFactoryInterface $config_factory
    *   The config factory.
@@ -132,14 +153,23 @@ class GroupManager {
    *   The state service.
    * @param \Drupal\og\PermissionManagerInterface $permission_manager
    *   The OG permission manager.
+   * @param \Drupal\og\OgRoleManagerInterface $og_role_manager
+   *   The OG role manager.
+   * @param \Drupal\Core\Routing\RouteBuilderInterface $route_builder
+   *   The route builder service.
+   * @param \Drupal\og\OgGroupAudienceHelperInterface $group_audience_helper
+   *   The OG group audience helper.
    */
-  public function __construct(ConfigFactoryInterface $config_factory, EntityTypeManagerInterface $entity_type_manager, EntityTypeBundleInfoInterface $entity_type_bundle_info, EventDispatcherInterface $event_dispatcher, StateInterface $state, PermissionManagerInterface $permission_manager) {
+  public function __construct(ConfigFactoryInterface $config_factory, EntityTypeManagerInterface $entity_type_manager, EntityTypeBundleInfoInterface $entity_type_bundle_info, EventDispatcherInterface $event_dispatcher, StateInterface $state, PermissionManagerInterface $permission_manager, OgRoleManagerInterface $og_role_manager, RouteBuilderInterface $route_builder, OgGroupAudienceHelperInterface $group_audience_helper) {
     $this->configFactory = $config_factory;
     $this->ogRoleStorage = $entity_type_manager->getStorage('og_role');
     $this->entityTypeBundleInfo = $entity_type_bundle_info;
     $this->eventDispatcher = $event_dispatcher;
     $this->state = $state;
     $this->permissionManager = $permission_manager;
+    $this->ogRoleManager = $og_role_manager;
+    $this->routeBuilder = $route_builder;
+    $this->groupAudienceHelper = $group_audience_helper;
   }
 
   /**
@@ -156,6 +186,24 @@ class GroupManager {
   public function isGroup($entity_type_id, $bundle) {
     $group_map = $this->getGroupMap();
     return isset($group_map[$entity_type_id]) && in_array($bundle, $group_map[$entity_type_id]);
+  }
+
+  /**
+   * Checks if the given entity bundle is group content.
+   *
+   * This is provided as a convenient sister method to ::isGroup(). It is a
+   * simple wrapper for OgGroupAudienceHelperInterface::hasGroupAudienceField().
+   *
+   * @param string $entity_type_id
+   *   The entity type ID.
+   * @param string $bundle
+   *   The bundle name.
+   *
+   * @return bool
+   *   TRUE if the entity bundle is group content.
+   */
+  public function isGroupContent($entity_type_id, $bundle) {
+    return $this->groupAudienceHelper->hasGroupAudienceField($entity_type_id, $bundle);
   }
 
   /**
@@ -185,6 +233,58 @@ class GroupManager {
   }
 
   /**
+   * Returns a list of all group content bundles keyed by entity type.
+   *
+   * This will return a simple list of group content bundles. If you need
+   * information about the relations between groups and group content bundles
+   * then use getGroupRelationMap() instead.
+   *
+   * @return array
+   *   An associative array of group content bundle IDs, keyed by entity type
+   *   ID.
+   *
+   * @see \Drupal\og\GroupTypeManager::getGroupRelationMap()
+   */
+  public function getAllGroupContentBundles() {
+    $bundles = [];
+    foreach ($this->getGroupRelationMap() as $group_entity_type_id => $group_bundle_ids) {
+      foreach ($group_bundle_ids as $group_content_entity_type_ids) {
+        foreach ($group_content_entity_type_ids as $group_content_entity_type_id => $group_content_bundle_ids) {
+          $bundles[$group_content_entity_type_id] = array_merge(isset($bundles[$group_content_entity_type_id]) ? $bundles[$group_content_entity_type_id] : [], $group_content_bundle_ids);
+        }
+      }
+    }
+    return $bundles;
+  }
+
+  /**
+   * Returns a list of all group content bundles filtered by entity type.
+   *
+   * This will return a simple list of group content bundles. If you need
+   * information about the relations between groups and group content bundles
+   * then use getGroupRelationMap() instead.
+   *
+   * @param string $entity_type_id
+   *   Entity type ID to filter the bundles by.
+   *
+   * @return array
+   *   An array of group content bundle IDs.
+   *
+   * @throws \InvalidArgumentException
+   *   Thrown when the passed in entity type ID does not have any group content
+   *   bundles defined.
+   *
+   * @see \Drupal\og\GroupTypeManager::getGroupRelationMap()
+   */
+  public function getAllGroupContentBundlesByEntityType($entity_type_id) {
+    $bundles = $this->getAllGroupContentBundles();
+    if (!isset($bundles[$entity_type_id])) {
+      throw new \InvalidArgumentException("The '$entity_type_id' entity type has no group content bundles.");
+    }
+    return $bundles[$entity_type_id];
+  }
+
+  /**
    * Returns all group bundles that are referenced by the given group content.
    *
    * @param string $group_content_entity_type_id
@@ -200,7 +300,7 @@ class GroupManager {
   public function getGroupBundleIdsByGroupContentBundle($group_content_entity_type_id, $group_content_bundle_id) {
     $bundles = [];
 
-    foreach (OgGroupAudienceHelper::getAllGroupAudienceFields($group_content_entity_type_id, $group_content_bundle_id) as $field) {
+    foreach ($this->groupAudienceHelper->getAllGroupAudienceFields($group_content_entity_type_id, $group_content_bundle_id) as $field) {
       $group_entity_type_id = $field->getSetting('target_type');
       $handler_settings = $field->getSetting('handler_settings');
       $group_bundle_ids = !empty($handler_settings['target_bundles']) ? $handler_settings['target_bundles'] : [];
@@ -268,8 +368,11 @@ class GroupManager {
     $event = new GroupCreationEvent($entity_type_id, $bundle_id);
     $this->eventDispatcher->dispatch(GroupCreationEventInterface::EVENT_NAME, $event);
 
-    $this->createPerBundleRoles($entity_type_id, $bundle_id);
+    $this->ogRoleManager->createPerBundleRoles($entity_type_id, $bundle_id);
     $this->refreshGroupMap();
+
+    // Routes will need to be rebuilt.
+    $this->routeBuilder->setRebuildNeeded();
   }
 
   /**
@@ -294,116 +397,12 @@ class GroupManager {
       $editable->save();
 
       // Remove all roles associated with this group type.
-      $this->removeRoles($entity_type_id, $bundle_id);
+      $this->ogRoleManager->removeRoles($entity_type_id, $bundle_id);
 
       $this->resetGroupMap();
-    }
-  }
 
-  /**
-   * Creates the roles for the given group type, based on the default roles.
-   *
-   * This is intended to be called after a new group type has been created.
-   *
-   * @param string $entity_type_id
-   *   The entity type ID of the group for which to create default roles.
-   * @param string $bundle_id
-   *   The bundle ID of the group for which to create default roles.
-   *
-   * @todo: Would a dedicated RoleManager service be a better place for this?
-   */
-  protected function createPerBundleRoles($entity_type_id, $bundle_id) {
-    foreach ($this->getDefaultRoles() as $role) {
-      $role->setGroupType($entity_type_id);
-      $role->setGroupBundle($bundle_id);
-
-      // Populate the default roles with a set of default permissions.
-      $permissions = $this->permissionManager->getDefaultGroupPermissions($entity_type_id, $bundle_id, $role->getName());
-      foreach (array_keys($permissions) as $permission) {
-        $role->grantPermission($permission);
-      }
-
-      $role->save();
-    }
-  }
-
-  /**
-   * Returns the default roles.
-   *
-   * @return \Drupal\og\Entity\OgRole[]
-   *   An associative array of (unsaved) OgRole entities, keyed by role name.
-   *   These are populated with the basic properties: name, label, role_type and
-   *   is_admin.
-   *
-   * @todo: Would a dedicated RoleManager service be a better place for this?
-   */
-  public function getDefaultRoles() {
-    // Provide the required default roles: 'member' and 'non-member'.
-    $roles = $this->getRequiredDefaultRoles();
-
-    $event = new DefaultRoleEvent();
-    $this->eventDispatcher->dispatch(DefaultRoleEventInterface::EVENT_NAME, $event);
-
-    // Use the array union operator '+=' to ensure the default roles cannot be
-    // altered by event subscribers.
-    $roles += $event->getRoles();
-
-    return $roles;
-  }
-
-  /**
-   * Returns the roles which every group type requires.
-   *
-   * This provides the 'member' and 'non-member' roles. These are hard coded
-   * because they are strictly required and should not be altered.
-   *
-   * @return \Drupal\og\Entity\OgRole[]
-   *   An associative array of (unsaved) required OgRole entities, keyed by role
-   *   name. These are populated with the basic properties: name, label and
-   *   role_type.
-   *
-   * @todo: Would a dedicated RoleManager service be a better place for this?
-   */
-  protected function getRequiredDefaultRoles() {
-    $roles = [];
-
-    $role_properties = [
-      [
-        'role_type' => OgRoleInterface::ROLE_TYPE_REQUIRED,
-        'label' => 'Non-member',
-        'name' => OgRoleInterface::ANONYMOUS,
-      ],
-      [
-        'role_type' => OgRoleInterface::ROLE_TYPE_REQUIRED,
-        'label' => 'Member',
-        'name' => OgRoleInterface::AUTHENTICATED,
-      ],
-    ];
-
-    foreach ($role_properties as $properties) {
-      $roles[$properties['name']] = $this->ogRoleStorage->create($properties);
-    }
-
-    return $roles;
-  }
-
-  /**
-   * Deletes the roles associated with a group type.
-   *
-   * @param string $entity_type_id
-   *   The entity type ID of the group for which to delete the roles.
-   * @param string $bundle_id
-   *   The bundle ID of the group for which to delete the roles.
-   *
-   * @todo: Would a dedicated RoleManager service be a better place for this?
-   */
-  protected function removeRoles($entity_type_id, $bundle_id) {
-    $properties = [
-      'group_type' => $entity_type_id,
-      'group_bundle' => $bundle_id,
-    ];
-    foreach ($this->ogRoleStorage->loadByProperties($properties) as $role) {
-      $role->delete();
+      // Routes will need to be rebuilt.
+      $this->routeBuilder->setRebuildNeeded();
     }
   }
 
@@ -441,7 +440,7 @@ class GroupManager {
    * @return array
    *   The group map.
    */
-  protected function getGroupMap() {
+  public function getGroupMap() {
     if (empty($this->groupMap)) {
       $this->refreshGroupMap();
     }
